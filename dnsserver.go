@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 
 	"github.com/miekg/dns"
@@ -22,22 +23,30 @@ func (s SRVRecord) Equal(s2 SRVRecord) bool {
 
 // Struct which describes the DNS server.
 type DNSServer struct {
-	Domain     string                 // using the constructor, this will always end in a '.', making it a FQDN.
-	aRecords   map[string][]net.IP    // FQDN -> IP
-	srvRecords map[string][]SRVRecord // service (e.g., _test._tcp) -> SRV
-	aMutex     sync.RWMutex           // mutex for A record operations
-	srvMutex   sync.RWMutex           // mutex for SRV record operations
+	Domain          string                 // using the constructor, this will always end in a '.', making it a FQDN.
+	aRecords        map[string][]net.IP    // FQDN -> IP
+	srvRecords      map[string][]SRVRecord // service (e.g., _test._tcp) -> SRV
+	cnameRecords    map[string]string
+	cnameMutex      sync.RWMutex // mutex for CNAME record operations
+	aMutex          sync.RWMutex // mutex for A record operations
+	srvMutex        sync.RWMutex // mutex for SRV record operations
+	randomize       bool         //randomize IPs if A record has multiple ip addresses
+	maxIPsPerRecord int          //return only this amount of ip addresses for A records
 }
 
 // Create a new DNS server. Domain is an unqualified domain that will be used
 // as the TLD.
-func NewDNSServer(domain string) *DNSServer {
+func NewDNSServer(domain string, randomize bool, maxIPsPerRecord int) *DNSServer {
 	return &DNSServer{
-		Domain:     domain + ".",
-		aRecords:   map[string][]net.IP{},
-		srvRecords: map[string][]SRVRecord{},
-		aMutex:     sync.RWMutex{},
-		srvMutex:   sync.RWMutex{},
+		Domain:          domain + ".",
+		aRecords:        map[string][]net.IP{},
+		cnameRecords:    map[string]string{},
+		srvRecords:      map[string][]SRVRecord{},
+		cnameMutex:      sync.RWMutex{},
+		aMutex:          sync.RWMutex{},
+		srvMutex:        sync.RWMutex{},
+		randomize:       randomize,
+		maxIPsPerRecord: maxIPsPerRecord,
 	}
 }
 
@@ -51,6 +60,9 @@ func (ds *DNSServer) Listen(listenSpec string) error {
 // Convenience function to ensure the fqdn is well-formed, and keeps the
 // set/delete interface easy.
 func (ds *DNSServer) qualifyHost(host string) string {
+	if host == "" {
+		return ds.Domain
+	}
 	return host + "." + ds.Domain
 }
 
@@ -73,15 +85,51 @@ func (ds *DNSServer) qualifySrvHosts(srvs []SRVRecord) []SRVRecord {
 	return newsrvs
 }
 
+// Sets a host to an IP. Note that this is not the FQDN, but a hostname.
+func (ds *DNSServer) SetCNAME(host string, domain string) {
+	ds.cnameMutex.Lock()
+	if !strings.HasSuffix(domain, ".") {
+		domain = domain + "."
+	}
+	ds.cnameRecords[ds.qualifyHost(host)] = domain
+	ds.cnameMutex.Unlock()
+}
+
+// Receives a FQDN; looks up and supplies the A records.
+func (ds *DNSServer) GetCNAME(fqdn string) *dns.CNAME {
+	ds.cnameMutex.RLock()
+	defer ds.cnameMutex.RUnlock()
+	val, ok := ds.cnameRecords[fqdn]
+	if ok {
+		return &dns.CNAME{
+			Hdr: dns.RR_Header{
+				Name:   fqdn,
+				Rrtype: dns.TypeCNAME,
+				Class:  dns.ClassINET,
+				// 0 TTL results in UB for DNS resolvers and generally causes problems.
+				Ttl: 30,
+			},
+			Target: val,
+		}
+
+	}
+
+	return nil
+}
+
 // Receives a FQDN; looks up and supplies the A records.
 func (ds *DNSServer) GetA(fqdn string) []dns.RR {
 	ds.aMutex.RLock()
 	defer ds.aMutex.RUnlock()
 	val, ok := ds.aRecords[fqdn]
 
+	if !ok && strings.Count(fqdn, ".") > 2 {
+		fqdn_no_sub := strings.SplitAfterN(fqdn, ".", 2)[1]
+		val, ok = ds.aRecords["*."+fqdn_no_sub]
+	}
 	if ok {
 		rr_records := []dns.RR{}
-		for i := 0; i < len(ds.aRecords[fqdn]); i++ {
+		for i := 0; i < len(val); i++ {
 			rr_records = append(rr_records, &dns.A{
 				Hdr: dns.RR_Header{
 					Name:   fqdn,
@@ -99,7 +147,7 @@ func (ds *DNSServer) GetA(fqdn string) []dns.RR {
 
 	return nil
 }
-func (ds *DNSServer) GetRandomA(fqdn string) []dns.RR {
+func (ds *DNSServer) GetRandomizedA(fqdn string) []dns.RR {
 	records := ds.GetA(fqdn)
 	for i := len(records) - 1; i > 0; i-- {
 		j := rand.Intn(i + 1)
@@ -116,11 +164,18 @@ func (ds *DNSServer) SetA(host string, ip net.IP) {
 	ds.aMutex.Unlock()
 }
 
+// Sets a host to an IP. Note that this is not the FQDN, but a hostname.
+func (ds *DNSServer) SetMultipleA(host string, ips []net.IP) {
+	ds.aMutex.Lock()
+	ds.aRecords[ds.qualifyHost(host)] = ips
+
+	ds.aMutex.Unlock()
+}
+
 // Deletes a host. Note that this is not the FQDN, but a hostname.
 func (ds *DNSServer) DeleteA(host string, ip net.IP) {
 	ds.aMutex.Lock()
 	var key int
-	fmt.Println(ds.aRecords[ds.qualifyHost(host)])
 	for i := 0; i < len(ds.aRecords[ds.qualifyHost(host)]); i++ {
 		if ds.aRecords[ds.qualifyHost(host)][i].Equal(ip) {
 			key = i
@@ -192,10 +247,26 @@ func (ds *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		// nil records == not found
 		switch question.Qtype {
 		case dns.TypeA:
-			a_records := ds.GetRandomA(question.Name)
-			if a_records != nil {
-				answers = append(answers, a_records...)
+			var a_records []dns.RR
+			if ds.randomize {
+				a_records = ds.GetRandomizedA(question.Name)
+			} else {
+				a_records = ds.GetA(question.Name)
 			}
+			if a_records != nil {
+				if ds.maxIPsPerRecord != 0 && len(a_records) > ds.maxIPsPerRecord {
+					a_records = a_records[0:ds.maxIPsPerRecord]
+
+				} else {
+					answers = append(answers, a_records...)
+				}
+			}
+		case dns.TypeCNAME:
+			cname_record := ds.GetCNAME(question.Name)
+			if cname_record != nil {
+				answers = append(answers, cname_record)
+			}
+
 		case dns.TypeSRV:
 			srv := ds.GetSRV(question.Name)
 
@@ -220,6 +291,6 @@ func (ds *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	m.Authoritative = true
 	m.RecursionAvailable = true
 	m.Answer = answers
-
 	w.WriteMsg(m)
+
 }
