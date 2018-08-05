@@ -23,7 +23,9 @@ func (s SRVRecord) Equal(s2 SRVRecord) bool {
 
 // Struct which describes the DNS server.
 type DNSServer struct {
-	Domain          string                 // using the constructor, this will always end in a '.', making it a FQDN.
+	Domain          string // using the constructor, this will always end in a '.', making it a FQDN.
+	soaRecord       dns.SOA
+	soaMutex        sync.RWMutex
 	aRecords        map[string][]net.IP    // FQDN -> IP
 	srvRecords      map[string][]SRVRecord // service (e.g., _test._tcp) -> SRV
 	cnameRecords    map[string]string
@@ -39,6 +41,8 @@ type DNSServer struct {
 func NewDNSServer(domain string, randomize bool, maxIPsPerRecord int) *DNSServer {
 	return &DNSServer{
 		Domain:          domain + ".",
+		soaRecord:       dns.SOA{},
+		soaMutex:        sync.RWMutex{},
 		aRecords:        map[string][]net.IP{},
 		cnameRecords:    map[string]string{},
 		srvRecords:      map[string][]SRVRecord{},
@@ -83,6 +87,28 @@ func (ds *DNSServer) qualifySrvHosts(srvs []SRVRecord) []SRVRecord {
 	}
 
 	return newsrvs
+}
+
+// Sets SOA
+func (ds *DNSServer) SetSOA(name string, mname string, rname string, serial uint32, refresh uint32, retry uint32, expire uint32, ttl uint32) {
+	ds.soaMutex.Lock()
+	ds.soaRecord.Hdr = dns.RR_Header{name + ".", dns.TypeSOA, dns.ClassINET, 14400, 0}
+	ds.soaRecord.Ns = mname
+	ds.soaRecord.Mbox = rname
+
+	ds.soaRecord.Serial = serial
+	ds.soaRecord.Refresh = refresh
+	ds.soaRecord.Retry = retry
+	ds.soaRecord.Expire = expire
+	ds.soaRecord.Minttl = ttl
+	ds.soaMutex.Unlock()
+}
+
+// Receives a FQDN; looks up and supplies the SOA records.
+func (ds *DNSServer) GetSOA(fqdn string) *dns.SOA {
+	ds.soaMutex.RLock()
+	defer ds.soaMutex.RUnlock()
+	return &ds.soaRecord
 }
 
 // Sets a host to an IP. Note that this is not the FQDN, but a hostname.
@@ -265,6 +291,11 @@ func (ds *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 			cname_record := ds.GetCNAME(question.Name)
 			if cname_record != nil {
 				answers = append(answers, cname_record)
+			}
+		case dns.TypeSOA:
+			soa_record := ds.GetSOA(question.Name)
+			if soa_record != nil {
+				answers = append(answers, soa_record)
 			}
 
 		case dns.TypeSRV:
