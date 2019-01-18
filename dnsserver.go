@@ -331,12 +331,12 @@ func (ds *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	if ednsRequest != nil {
 		m.SetEdns0(ednsRequest.UDPSize(), false)
 		if ednsRequest.Version() != 0 {
-			m.SetExtendedRcode(dns.RcodeBadVers)
+			m.SetRcode(r, dns.RcodeBadVers)
+			m.Authoritative = false
 			w.WriteMsg(m)
 			return
 		}
 	}
-	fmt.Println("FAIL")
 	answers := []dns.RR{}
 	authority_answers := []dns.RR{}
 
