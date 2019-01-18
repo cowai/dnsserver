@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -28,6 +29,8 @@ type DNSServer struct {
 	soaMutex        sync.RWMutex
 	aRecords        map[string][]net.IP    // FQDN -> IP
 	srvRecords      map[string][]SRVRecord // service (e.g., _test._tcp) -> SRV
+	nsRecords       map[string][]string
+	nsMutex         sync.RWMutex // mutex for CNAME record operations
 	cnameRecords    map[string]string
 	cnameMutex      sync.RWMutex // mutex for CNAME record operations
 	aMutex          sync.RWMutex // mutex for A record operations
@@ -44,6 +47,8 @@ func NewDNSServer(domain string, randomize bool, maxIPsPerRecord int) *DNSServer
 		soaRecord:       dns.SOA{},
 		soaMutex:        sync.RWMutex{},
 		aRecords:        map[string][]net.IP{},
+		nsRecords:       map[string][]string{},
+		nsMutex:         sync.RWMutex{},
 		cnameRecords:    map[string]string{},
 		srvRecords:      map[string][]SRVRecord{},
 		cnameMutex:      sync.RWMutex{},
@@ -57,8 +62,8 @@ func NewDNSServer(domain string, randomize bool, maxIPsPerRecord int) *DNSServer
 // Listen for DNS requests. listenSpec is a dotted-quad + port, e.g.,
 // 127.0.0.1:53. This function blocks and only returns when the DNS service is
 // no longer functioning.
-func (ds *DNSServer) Listen(listenSpec string) error {
-	return dns.ListenAndServe(listenSpec, "udp", ds)
+func (ds *DNSServer) Listen(listenSpec string, packet_type string) error {
+	return dns.ListenAndServe(listenSpec, packet_type, ds)
 }
 
 // Convenience function to ensure the fqdn is well-formed, and keeps the
@@ -108,7 +113,53 @@ func (ds *DNSServer) SetSOA(name string, mname string, rname string, serial uint
 func (ds *DNSServer) GetSOA(fqdn string) *dns.SOA {
 	ds.soaMutex.RLock()
 	defer ds.soaMutex.RUnlock()
-	return &ds.soaRecord
+	if strings.Contains(fqdn, ds.Domain) {
+		return &ds.soaRecord
+	}
+	return nil
+}
+
+func (ds *DNSServer) SetMultipleNS(fqdn string, hosts []string) {
+	ds.nsMutex.Lock()
+	for i := 0; i < len(hosts); i++ {
+
+		if !strings.HasSuffix(hosts[i], ".") {
+			hosts[i] = hosts[i] + "."
+		}
+	}
+	ds.nsRecords[ds.qualifyHost(fqdn)] = hosts
+	ds.nsMutex.Unlock()
+}
+
+// Receives a FQDN; looks up and supplies the A records.
+func (ds *DNSServer) GetNS(fqdn string) []dns.RR {
+	ds.nsMutex.RLock()
+	defer ds.nsMutex.RUnlock()
+	val, ok := ds.nsRecords[fqdn]
+
+	if !ok && strings.Count(fqdn, ".") > 2 {
+		fqdn_no_sub := strings.SplitAfterN(fqdn, ".", 2)[1]
+		val, ok = ds.nsRecords["*."+fqdn_no_sub]
+	}
+	if ok {
+		rr_records := []dns.RR{}
+		for i := 0; i < len(val); i++ {
+			rr_records = append(rr_records, &dns.NS{
+				Hdr: dns.RR_Header{
+					Name:   fqdn,
+					Rrtype: dns.TypeNS,
+					Class:  dns.ClassINET,
+					// 0 TTL results in UB for DNS resolvers and generally causes problems.
+					Ttl: 3600,
+				},
+				Ns: val[i],
+			})
+		}
+		return rr_records
+
+	}
+
+	return nil
 }
 
 // Sets a host to an IP. Note that this is not the FQDN, but a hostname.
@@ -151,7 +202,13 @@ func (ds *DNSServer) GetA(fqdn string) []dns.RR {
 
 	if !ok && strings.Count(fqdn, ".") > 2 {
 		fqdn_no_sub := strings.SplitAfterN(fqdn, ".", 2)[1]
-		val, ok = ds.aRecords["*."+fqdn_no_sub]
+		singleHost_regex := regexp.MustCompile(`^.+_((worker|manager)-\d+).*`)
+		singleHost_match := singleHost_regex.FindStringSubmatch(fqdn)
+		if len(singleHost_match) > 1 {
+			val, ok = ds.aRecords["*_"+singleHost_match[1]+"."+fqdn_no_sub]
+		} else {
+			val, ok = ds.aRecords["*."+fqdn_no_sub]
+		}
 	}
 	if ok {
 		rr_records := []dns.RR{}
@@ -175,9 +232,11 @@ func (ds *DNSServer) GetA(fqdn string) []dns.RR {
 }
 func (ds *DNSServer) GetRandomizedA(fqdn string) []dns.RR {
 	records := ds.GetA(fqdn)
-	for i := len(records) - 1; i > 0; i-- {
-		j := rand.Intn(i + 1)
-		records[i], records[j] = records[j], records[i]
+	if len(records) > 1 {
+		for i := len(records) - 1; i > 0; i-- {
+			j := rand.Intn(i + 1)
+			records[i], records[j] = records[j], records[i]
+		}
 	}
 	return records
 }
@@ -265,11 +324,24 @@ func (ds *DNSServer) DeleteSRV(service, protocol string) {
 // constructs a response, and returns it to the connector.
 func (ds *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	m := &dns.Msg{}
+	m.Authoritative = true
+	m.RecursionAvailable = false
 	m.SetReply(r)
-
+	ednsRequest := r.IsEdns0()
+	if ednsRequest != nil {
+		m.SetEdns0(ednsRequest.UDPSize(), false)
+		if ednsRequest.Version() != 0 {
+			m.SetExtendedRcode(dns.RcodeBadVers)
+			w.WriteMsg(m)
+			return
+		}
+	}
+	fmt.Println("FAIL")
 	answers := []dns.RR{}
+	authority_answers := []dns.RR{}
 
 	for _, question := range r.Question {
+		question.Name = strings.ToLower(question.Name)
 		// nil records == not found
 		switch question.Qtype {
 		case dns.TypeA:
@@ -283,19 +355,44 @@ func (ds *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 				if ds.maxIPsPerRecord != 0 && len(a_records) > ds.maxIPsPerRecord {
 					a_records = a_records[0:ds.maxIPsPerRecord]
 
-				} else {
-					answers = append(answers, a_records...)
 				}
+				answers = append(answers, a_records...)
+
+			} else {
+				soa_record := ds.GetSOA(question.Name)
+				if soa_record != nil {
+					authority_answers = append(authority_answers, soa_record)
+				}
+			}
+		case dns.TypeTXT:
+			cname_record := ds.GetCNAME(question.Name)
+			if cname_record != nil {
+				answers = append(answers, cname_record)
 			}
 		case dns.TypeCNAME:
 			cname_record := ds.GetCNAME(question.Name)
 			if cname_record != nil {
 				answers = append(answers, cname_record)
+			} else {
+				soa_record := ds.GetSOA(question.Name)
+				if soa_record != nil {
+					authority_answers = append(authority_answers, soa_record)
+				}
 			}
 		case dns.TypeSOA:
 			soa_record := ds.GetSOA(question.Name)
 			if soa_record != nil {
 				answers = append(answers, soa_record)
+			}
+		case dns.TypeNS:
+			var ns_records []dns.RR
+			ns_records = ds.GetNS(question.Name)
+			if ns_records != nil {
+				if question.Name != ds.Domain {
+					authority_answers = append(authority_answers, ns_records...)
+				} else {
+					answers = append(answers, ns_records...)
+				}
 			}
 
 		case dns.TypeSRV:
@@ -312,16 +409,14 @@ func (ds *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	// If we have no answers, that means we found nothing or didn't get a query
 	// we can reply to. Reply with no answers so we ensure the query moves on to
 	// the next server.
-	if len(answers) == 0 {
+	if len(answers) == 0 && len(authority_answers) == 0 {
 		m.SetRcode(r, dns.RcodeSuccess)
 		w.WriteMsg(m)
 		return
 	}
 
-	// Without these the glibc resolver gets very angry.
-	m.Authoritative = true
-	m.RecursionAvailable = true
 	m.Answer = answers
+	m.Ns = authority_answers
 	w.WriteMsg(m)
 
 }
